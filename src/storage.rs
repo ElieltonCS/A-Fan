@@ -31,8 +31,12 @@ fn load_from(path: &Path) -> Result<Settings, String> {
     if bytes.len() > 16384 {
         return Err("Arquivo de configurações excede 16 KB.".into());
     }
-    let settings: Settings =
+    let mut settings: Settings =
         serde_json::from_slice(&bytes).map_err(|e| format!("Configurações inválidas: {e}"))?;
+    // Old custom curves are ignored; the Custom profile now deserializes as Auto.
+    if settings.version == 1 {
+        settings.version = 2;
+    }
     settings.validate()?;
     Ok(settings)
 }
@@ -48,7 +52,7 @@ fn save_to(path: &Path, settings: &Settings) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
-    fn invalid_curve_does_not_replace_saved_configuration() {
+    fn invalid_settings_do_not_replace_saved_configuration() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -60,7 +64,7 @@ mod tests {
         let mut settings = Settings::default();
         save_to(&path, &settings).unwrap();
         let original = fs::read(&path).unwrap();
-        settings.custom_curve.points[1].percent = 0;
+        settings.version = 99;
         assert!(save_to(&path, &settings).is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
         assert!(load_from(&path).is_ok());
@@ -79,11 +83,30 @@ mod tests {
         fs::write(&path, vec![b' '; 16385]).unwrap();
         assert!(load_from(&path).is_err());
         let settings = Settings {
-            version: 2,
+            version: 99,
             ..Settings::default()
         };
         write_json(&path, &settings).unwrap();
         assert!(load_from(&path).is_err());
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn legacy_manual_curve_is_replaced_by_fixed_auto_preset() {
+        let path =
+            std::env::temp_dir().join(format!("a-fan-migration-{}.json", std::process::id()));
+        let legacy = serde_json::json!({
+            "version": 1, "profile": "Custom", "calibration": null,
+            "custom_curve": {"points": [{"celsius": 85, "percent": 0}]}
+        });
+        write_json(&path, &legacy).unwrap();
+        let settings = load_from(&path).unwrap();
+        assert_eq!(settings.version, 2);
+        assert_eq!(settings.profile, crate::core::Profile::Auto);
+        assert_eq!(settings.curve().percent(80.), 100);
+        save_to(&path, &settings).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("custom_curve"));
+        assert!(!saved.contains("Custom"));
         fs::remove_file(path).unwrap();
     }
 }

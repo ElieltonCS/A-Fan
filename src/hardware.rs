@@ -245,6 +245,7 @@ impl Device {
         self.wmi.call(&self.instance, method, input, setter)
     }
     pub fn read(&self) -> Result<Telemetry, String> {
+        let started = std::time::Instant::now();
         let temperature = f64::from(core::sensor_value(self.raw(
             "GetGamingSysInfo",
             u64::from(core::sensor_input(1)),
@@ -263,7 +264,7 @@ impl Device {
             ..Default::default()
         };
         if !value.temperature_valid() {
-            return Err("Sensor de temperatura inválido; controle personalizado suspenso.".into());
+            return Err("Sensor de temperatura inválido; controle A-Fan suspenso.".into());
         }
         if self.controls_available {
             let (mode, speed) = core::decode_control(
@@ -272,6 +273,9 @@ impl Device {
             )?;
             value.fan_mode = Some(mode);
             value.fan_percent = Some(speed);
+        }
+        if started.elapsed() > core::STALE_AFTER {
+            return Err("Leitura dos sensores excedeu 3 segundos; controle A-Fan suspenso.".into());
         }
         Ok(value)
     }

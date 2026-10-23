@@ -39,7 +39,7 @@ try {
     $smokeProcess=Start-Process -FilePath $installedExe -ArgumentList @('--smoke-test',('"'+$smokePath+'"')) -WindowStyle Hidden -PassThru -Wait
     if($smokeProcess.ExitCode -ne 0){throw 'O teste integrado da interface falhou.'}
     $smoke=Get-Content -LiteralPath $smokePath -Raw|ConvertFrom-Json
-    if(!$smoke.starts_hidden -or !$smoke.minimize_hides -or !$smoke.close_hides -or !$smoke.tray_added -or !$smoke.editor_validated -or $smoke.hardware_writes -ne 0){throw 'A interface não passou na verificação integrada.'}
+    if(!$smoke.starts_hidden -or !$smoke.minimize_hides -or !$smoke.close_hides -or !$smoke.tray_added -or !$smoke.presets_validated -or !$smoke.manual_controls_absent -or $smoke.preset_count -ne 5 -or $smoke.capture_error -or $smoke.hardware_writes -ne 0){throw 'A interface não passou na verificação integrada.'}
     $powerAfter=(& powercfg /getactivescheme|Out-String).Trim()
     if($powerBefore -ne $powerAfter){throw 'O plano de energia mudou durante a validação. Revise o diagnóstico.'}
     $result.native_diagnostic=$diagnosticPath;$result.ui_smoke=$smokePath;$result.power_scheme_unchanged=$true

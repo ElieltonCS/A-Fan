@@ -28,13 +28,13 @@ pub struct View {
     pub calibrating: bool,
     pub calibrated: bool,
     pub guard_ready: bool,
+    pub recovery_failed: bool,
     pub exit_ready: bool,
     pub last_sample: Option<Instant>,
     pub settings: Settings,
 }
 pub enum Request {
     Apply(Settings),
-    SaveDraft(Settings),
     Calibrate,
     Firmware,
     Suspend,
@@ -60,6 +60,7 @@ impl Runtime {
             calibrating: false,
             calibrated: false,
             guard_ready: false,
+            recovery_failed: false,
             exit_ready: false,
             last_sample: None,
             settings,
@@ -218,6 +219,7 @@ enum CalibrationPhase {
     Cooling,
     RecoveryBeforeReduction,
     Reducing,
+    VerifyingMaximum,
     RecoveryAtEnd,
 }
 struct CalibrationRun {
@@ -226,8 +228,16 @@ struct CalibrationRun {
     percent: u8,
     minimum: u8,
     phase: CalibrationPhase,
+    rpm_samples: Vec<u32>,
+    full_rpm: u32,
+    reduced_rpm: Option<u32>,
 }
 impl CalibrationRun {
+    fn median_rpm(&self) -> Option<u32> {
+        let mut samples: [u32; 3] = self.rpm_samples.as_slice().try_into().ok()?;
+        samples.sort_unstable();
+        Some(samples[1])
+    }
     fn recovery_confirmed(&mut self) -> Result<bool, String> {
         match self.phase {
             CalibrationPhase::RecoveryBeforeReduction => {
@@ -238,6 +248,14 @@ impl CalibrationRun {
             _ => Err("Confirmação de recuperação fora da etapa esperada.".into()),
         }
     }
+}
+fn rpm_response_verified(full: u32, reduced: Option<u32>, recovered: u32) -> bool {
+    full > 0
+        && reduced.is_some_and(|rpm| rpm > 0 && full.saturating_sub(rpm) >= 150.max(full / 10))
+        && full.abs_diff(recovered) <= full / 5
+}
+fn samples_ready(count: u8, last: Option<Instant>) -> bool {
+    count >= 3 && last.is_some_and(|t| t.elapsed() <= core::STALE_AFTER)
 }
 fn update(state: &Arc<Mutex<View>>, f: impl FnOnce(&mut View)) {
     f(&mut state.lock().unwrap_or_else(|e| e.into_inner()));
@@ -273,18 +291,6 @@ fn worker(state: Arc<Mutex<View>>, receiver: Receiver<Request>, read_only: bool)
                             update(&state, |s| {
                                 s.message = "Aplicação bloqueada: sensores indisponíveis.".into()
                             });
-                        }
-                        Request::SaveDraft(draft) => {
-                            let mut saved = state
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .settings
-                                .clone();
-                            saved.custom_curve = draft.custom_curve;
-                            match storage::save(&saved) {
-                                Ok(()) => update(&state, |s| s.settings = saved),
-                                Err(e) => update(&state, |s| s.message = e),
-                            }
                         }
                         Request::Diagnostic => {
                             let _ = storage::write_json(
@@ -384,13 +390,6 @@ fn worker(state: Arc<Mutex<View>>, receiver: Receiver<Request>, read_only: bool)
                             )
                         });
                     }
-                    Request::SaveDraft(draft) => {
-                        let mut saved = settings.clone();
-                        saved.custom_curve = draft.custom_curve;
-                        saved.validate()?;
-                        storage::save(&saved)?;
-                        settings = saved;
-                    }
                     Request::Apply(new_settings) => {
                         new_settings.validate()?;
                         if read_only && new_settings.profile != Profile::Firmware {
@@ -403,7 +402,13 @@ fn worker(state: Arc<Mutex<View>>, receiver: Receiver<Request>, read_only: bool)
                             stop_control(&mut device, &mut guard, &mut controller)?;
                             active = false;
                             resume_desired = false;
+                            calibration = None;
                         } else {
+                            if calibration.is_some() {
+                                return Err(
+                                    "Aguarde a calibração antes de aplicar um preset.".into()
+                                );
+                            }
                             if !device.controls_available {
                                 return Err(device.reason.clone());
                             }
@@ -414,7 +419,10 @@ fn worker(state: Arc<Mutex<View>>, receiver: Receiver<Request>, read_only: bool)
                                     "Calibração não validada para este notebook e BIOS.".into()
                                 );
                             }
-                            if good_samples < 3 {
+                            if !samples_ready(
+                                good_samples,
+                                state.lock().unwrap_or_else(|e| e.into_inner()).last_sample,
+                            ) {
                                 return Err("Aguarde três leituras válidas dos sensores.".into());
                             }
                             if guard.is_none() {
@@ -439,7 +447,10 @@ fn worker(state: Arc<Mutex<View>>, receiver: Receiver<Request>, read_only: bool)
                         if calibration.is_some() {
                             return Err("Uma calibração já está em andamento.".into());
                         }
-                        if good_samples < 3 {
+                        if !samples_ready(
+                            good_samples,
+                            state.lock().unwrap_or_else(|e| e.into_inner()).last_sample,
+                        ) {
                             return Err("Aguarde os sensores estabilizarem.".into());
                         }
                         stop_control(&mut device, &mut guard, &mut controller)?;
@@ -455,17 +466,24 @@ fn worker(state: Arc<Mutex<View>>, receiver: Receiver<Request>, read_only: bool)
                             percent: 100,
                             minimum: 100,
                             phase: CalibrationPhase::Cooling,
+                            rpm_samples: Vec::with_capacity(3),
+                            full_rpm: 0,
+                            reduced_rpm: None,
                         });
                     }
                 }
                 Ok(())
             })();
+            if outcome.is_ok() && guard.is_none() {
+                update(&state, |s| s.recovery_failed = false);
+            }
             if let Err(error) = outcome {
                 let recovery = stop_control(&mut device, &mut guard, &mut controller);
                 active = false;
                 resume_desired = false;
                 calibration = None;
                 update(&state, |s| {
+                    s.recovery_failed = recovery.is_err();
                     s.message = match recovery {
                         Ok(()) => error,
                         Err(e) => format!("{error} Retorno à Acer NÃO confirmado: {e}"),
@@ -540,7 +558,7 @@ fn worker(state: Arc<Mutex<View>>, receiver: Receiver<Request>, read_only: bool)
                                 model: device.identity.model.clone(),
                                 bios: device.identity.bios.clone(),
                                 minimum_percent: run.minimum.saturating_add(10).clamp(30, 100),
-                                version: 1,
+                                version: 2,
                                 temperature_and_rpm_verified: true,
                                 independent_speed_verified: true,
                                 recovery_verified: true,
@@ -548,10 +566,6 @@ fn worker(state: Arc<Mutex<View>>, receiver: Receiver<Request>, read_only: bool)
                             device.force_restore()?;
                             settings.calibration = Some(verified);
                             settings.profile = Profile::Auto;
-                            let floor = settings.floor();
-                            for point in &mut settings.custom_curve.points {
-                                point.percent = point.percent.max(floor);
-                            }
                             storage::save(&settings)?;
                             calibration = None;
                             resume_desired = true;
@@ -572,30 +586,55 @@ fn worker(state: Arc<Mutex<View>>, receiver: Receiver<Request>, read_only: bool)
                         device.set_percent(100)?;
                         return Err("RPM zerado durante a calibração; redução interrompida.".into());
                     }
+                    run.rpm_samples.push(sample.rpm.unwrap());
+                    if run.rpm_samples.len() > 3 {
+                        run.rpm_samples.remove(0);
+                    }
                     if run.phase == CalibrationPhase::Cooling {
-                        if temperature <= 60. && run.step_since.elapsed() >= Duration::from_secs(10)
+                        if temperature <= 60.
+                            && run.step_since.elapsed() >= Duration::from_secs(10)
+                            && let Some(rpm) = run.median_rpm()
                         {
+                            run.full_rpm = rpm;
                             // Verify independent recovery from Custom 100% before any reduction.
                             guard.as_ref().unwrap().recovery_check()?;
                             run.phase = CalibrationPhase::RecoveryBeforeReduction;
                             run.step_since = Instant::now();
                         }
-                    } else {
+                    } else if run.phase == CalibrationPhase::Reducing {
                         if temperature > 65. {
                             return Err("Notebook acima de 65°C durante a busca do mínimo. Aguarde esfriar e repita.".into());
                         }
                         if run.step_since.elapsed() >= Duration::from_secs(10) {
+                            let rpm = run
+                                .median_rpm()
+                                .ok_or("RPM insuficiente para confirmar a redução.")?;
+                            if run.percent <= 80 {
+                                run.reduced_rpm =
+                                    Some(run.reduced_rpm.map_or(rpm, |old| old.min(rpm)));
+                            }
                             run.minimum = run.percent;
                             if run.percent == 30 {
-                                guard.as_ref().unwrap().recovery_check()?;
-                                run.phase = CalibrationPhase::RecoveryAtEnd;
-                                run.step_since = Instant::now();
+                                run.percent = 100;
+                                device.set_percent(100)?;
+                                run.phase = CalibrationPhase::VerifyingMaximum;
                             } else {
                                 run.percent -= 10;
                                 device.set_percent(run.percent)?;
-                                run.step_since = Instant::now();
                             }
+                            run.step_since = Instant::now();
+                            run.rpm_samples.clear();
                         }
+                    } else if run.step_since.elapsed() >= Duration::from_secs(10) {
+                        let rpm = run
+                            .median_rpm()
+                            .ok_or("RPM insuficiente para confirmar o máximo.")?;
+                        if !rpm_response_verified(run.full_rpm, run.reduced_rpm, rpm) {
+                            return Err("A rotação não confirmou a redução e o retorno ao máximo; calibração recusada.".into());
+                        }
+                        guard.as_ref().unwrap().recovery_check()?;
+                        run.phase = CalibrationPhase::RecoveryAtEnd;
+                        run.step_since = Instant::now();
                     }
                     update(&state, |s| {
                         s.message = if run.phase == CalibrationPhase::Cooling {
@@ -610,17 +649,14 @@ fn worker(state: Arc<Mutex<View>>, receiver: Receiver<Request>, read_only: bool)
                 }
             } else if active {
                 if sample.rpm == Some(0) {
-                    return Err(
-                        "RPM zerado em controle personalizado; retorno à Acer solicitado.".into(),
-                    );
+                    return Err("RPM zerado em controle A-Fan; retorno à Acer solicitado.".into());
                 }
                 if controller
                     .commanded()
                     .is_some_and(|p| sample.fan_mode != Some(3) || sample.fan_percent != Some(p))
                 {
                     return Err(
-                        "Outro controlador alterou a ventoinha. Controle personalizado suspenso."
-                            .into(),
+                        "Outro controlador alterou a ventoinha. Controle A-Fan suspenso.".into(),
                     );
                 }
                 let target =
@@ -650,6 +686,7 @@ fn worker(state: Arc<Mutex<View>>, receiver: Receiver<Request>, read_only: bool)
                 calibration = None;
                 resume_desired = false;
                 update(&state, |s| {
+                    s.recovery_failed = restore.is_err();
                     s.telemetry = Telemetry::default();
                     s.last_sample = None;
                     s.calibrating = false;
@@ -677,6 +714,9 @@ mod tests {
             percent: 100,
             minimum: 100,
             phase: CalibrationPhase::Cooling,
+            rpm_samples: vec![],
+            full_rpm: 0,
+            reduced_rpm: None,
         };
         assert!(run.recovery_confirmed().is_err());
         run.phase = CalibrationPhase::RecoveryBeforeReduction;
@@ -686,5 +726,20 @@ mod tests {
         assert!(run.recovery_confirmed().is_err());
         run.phase = CalibrationPhase::RecoveryAtEnd;
         assert!(run.recovery_confirmed().unwrap());
+    }
+    #[test]
+    fn calibration_requires_physical_rpm_response_and_fresh_samples() {
+        assert!(!rpm_response_verified(4000, Some(4000), 4000));
+        assert!(!rpm_response_verified(4000, None, 4000));
+        assert!(!rpm_response_verified(4000, Some(0), 4000));
+        assert!(!rpm_response_verified(4000, Some(3000), 3000));
+        assert!(rpm_response_verified(4000, Some(3000), 3900));
+        assert!(!samples_ready(2, Some(Instant::now())));
+        assert!(!samples_ready(3, None));
+        assert!(!samples_ready(
+            3,
+            Some(Instant::now() - Duration::from_secs(4))
+        ));
+        assert!(samples_ready(3, Some(Instant::now())));
     }
 }

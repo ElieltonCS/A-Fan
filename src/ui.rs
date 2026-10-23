@@ -1,5 +1,5 @@
 use crate::{
-    core::{Curve, Point, Profile, STALE_AFTER, Settings},
+    core::{Curve, MAX_TEMP, Profile, STALE_AFTER, Settings},
     hardware::wide,
     platform::{self, OwnedHandle},
     runtime::{Request, Runtime},
@@ -33,17 +33,12 @@ const EXIT_MESSAGE: u32 = WM_APP + 2;
 const ID_PROFILE: usize = 100;
 const ID_APPLY: usize = 101;
 const ID_CALIBRATE: usize = 102;
-const ID_SAVE: usize = 103;
-const ID_PREVIEW: usize = 104;
-const ID_ADD: usize = 105;
-const ID_REMOVE: usize = 106;
 const ID_STARTUP: usize = 107;
 const ID_DIAGNOSTIC: usize = 108;
 const ID_FOLDER: usize = 109;
 const ID_FIRMWARE: usize = 110;
 const ID_EXIT: usize = 111;
 const ID_OPEN: usize = 112;
-const ID_EDIT: usize = 200;
 const ID_MENU_PROFILE: usize = 300;
 
 struct Smoke {
@@ -52,7 +47,8 @@ struct Smoke {
     stage: u8,
     initial_hidden: bool,
     minimize_hides: bool,
-    editor_valid: bool,
+    presets_valid: bool,
+    manual_controls_absent: bool,
     capture_error: Option<String>,
 }
 struct App {
@@ -65,8 +61,8 @@ struct App {
     metrics: HWND,
     status: HWND,
     active: HWND,
-    edits: Vec<(HWND, HWND)>,
-    labels: Vec<(HWND, HWND)>,
+    description: HWND,
+    points: HWND,
     apply: HWND,
     calibrate: HWND,
     startup: HWND,
@@ -76,12 +72,10 @@ struct App {
     icon: HICON,
     dpi: f64,
     loading: bool,
-    focused_row: usize,
     taskbar_message: u32,
     last_tooltip: String,
     smoke: Option<Smoke>,
     tray_added: bool,
-    pending_save: bool,
     heat_alert_shown: bool,
 }
 impl App {
@@ -101,8 +95,8 @@ impl App {
             metrics: HWND::default(),
             status: HWND::default(),
             active: HWND::default(),
-            edits: vec![],
-            labels: vec![],
+            description: HWND::default(),
+            points: HWND::default(),
             apply: HWND::default(),
             calibrate: HWND::default(),
             startup: HWND::default(),
@@ -112,7 +106,6 @@ impl App {
             icon: HICON::default(),
             dpi,
             loading: false,
-            focused_row: 1,
             taskbar_message: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             last_tooltip: String::new(),
             smoke: smoke.map(|path| Smoke {
@@ -121,11 +114,11 @@ impl App {
                 stage: 0,
                 initial_hidden: false,
                 minimize_hides: false,
-                editor_valid: false,
+                presets_valid: false,
+                manual_controls_absent: false,
                 capture_error: None,
             }),
             tray_added: false,
-            pending_save: false,
             heat_alert_shown: false,
         }
     }
@@ -232,16 +225,7 @@ impl App {
                 Some(LPARAM(1)),
             );
             self.status = self.child(w!("STATIC"), "", 4, 24, 135, 710, 56, 0);
-            self.child(
-                w!("STATIC"),
-                "Perfil para aplicar / editar",
-                5,
-                24,
-                204,
-                210,
-                20,
-                0,
-            );
+            self.child(w!("STATIC"), "Preset de ventilação", 5, 24, 204, 210, 20, 0);
             self.combo = self.child(
                 w!("COMBOBOX"),
                 "",
@@ -291,103 +275,28 @@ impl App {
                 24,
                 0,
             );
-            self.child(w!("STATIC"), "Curva de velocidade", 7, 24, 308, 360, 24, 0);
-            self.child(w!("STATIC"), "Pontos da curva", 8, 446, 308, 265, 24, 0);
-            for row in 0..8 {
-                let y = 341 + row * 28;
-                let first_label = self.child(
-                    w!("STATIC"),
-                    &format!("{} · °C", row + 1),
-                    20 + row as usize * 2,
-                    446,
-                    y + 4,
-                    52,
-                    22,
-                    0,
-                );
-                let temp = self.child(
-                    w!("EDIT"),
-                    "",
-                    ID_EDIT + row as usize * 2,
-                    503,
-                    y,
-                    67,
-                    25,
-                    WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32,
-                );
-                let second_label = self.child(
-                    w!("STATIC"),
-                    "Vel. %",
-                    21 + row as usize * 2,
-                    586,
-                    y + 4,
-                    47,
-                    22,
-                    0,
-                );
-                let percent = self.child(
-                    w!("EDIT"),
-                    "",
-                    ID_EDIT + row as usize * 2 + 1,
-                    641,
-                    y,
-                    67,
-                    25,
-                    WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32,
-                );
-                SendMessageW(temp, EM_SETLIMITTEXT, Some(WPARAM(8)), Some(LPARAM(0)));
-                SendMessageW(percent, EM_SETLIMITTEXT, Some(WPARAM(3)), Some(LPARAM(0)));
-                self.labels.push((first_label, second_label));
-                self.edits.push((temp, percent));
-            }
-            self.child(
-                w!("BUTTON"),
-                "Adicionar",
-                ID_ADD,
-                446,
-                572,
-                120,
-                29,
-                WS_TABSTOP.0,
-            );
-            self.child(
-                w!("BUTTON"),
-                "Remover ponto",
-                ID_REMOVE,
-                580,
-                572,
-                128,
-                29,
-                WS_TABSTOP.0,
-            );
-            self.child(
-                w!("BUTTON"),
-                "Atualizar prévia",
-                ID_PREVIEW,
-                24,
-                572,
-                164,
-                29,
-                WS_TABSTOP.0,
-            );
-            self.child(
-                w!("BUTTON"),
-                "Salvar curva",
-                ID_SAVE,
-                205,
-                572,
-                164,
-                29,
-                WS_TABSTOP.0,
-            );
+            self.child(w!("STATIC"), "Prévia do preset", 7, 24, 308, 360, 24, 0);
             self.child(
                 w!("STATIC"),
-                "85°C força 100%. A prévia não altera a ventoinha.",
+                "Comportamento do preset",
+                8,
+                446,
+                308,
+                265,
+                24,
+                0,
+            );
+            self.description = self.child(w!("STATIC"), "", 11, 446, 341, 265, 66, 0);
+            self.points = self.child(w!("STATIC"), "", 12, 446, 416, 265, 138, 0);
+            self.child(
+                w!("STATIC"),
+                "Presets A-Fan: mínimo de 40% ou o mínimo calibrado, se maior.
+100% até 80°C; alerta a 85°C. Os limites não garantem a temperatura da CPU.",
                 9,
                 24,
-                610,
+                577,
                 690,
-                24,
+                46,
                 0,
             );
             self.startup = self.child(
@@ -514,54 +423,20 @@ impl App {
                 )),
                 Some(LPARAM(0)),
             );
-            for (index, &(temperature, percent)) in self.edits.iter().enumerate() {
-                let enabled = index < self.curve.points.len();
-                for control in [
-                    temperature,
-                    percent,
-                    self.labels[index].0,
-                    self.labels[index].1,
-                ] {
-                    let _ = ShowWindow(control, if enabled { SW_SHOW } else { SW_HIDE });
-                }
-                if let Some(point) = self.curve.points.get(index) {
-                    set_text(temperature, &format_number(point.celsius));
-                    set_text(percent, &point.percent.to_string());
-                    let last = index == self.curve.points.len() - 1;
-                    SendMessageW(
-                        temperature,
-                        EM_SETREADONLY,
-                        Some(WPARAM(last as usize)),
-                        Some(LPARAM(0)),
-                    );
-                    SendMessageW(
-                        percent,
-                        EM_SETREADONLY,
-                        Some(WPARAM(last as usize)),
-                        Some(LPARAM(0)),
-                    );
-                }
-            }
+            set_text(self.description, self.selected.description());
+            let points = if self.selected == Profile::Firmware {
+                "O A-Fan não define limites nem uma curva para o automático Acer.".into()
+            } else {
+                self.curve
+                    .points
+                    .iter()
+                    .map(|p| format!("{}°C   →   {}%", format_number(p.celsius), p.percent))
+                    .collect::<Vec<_>>()
+                    .join("\r\n")
+            };
+            set_text(self.points, &points);
             self.loading = false;
             let _ = InvalidateRect(Some(self.hwnd), None, false);
-        }
-    }
-    unsafe fn read_curve(&self) -> Result<Curve, String> {
-        unsafe {
-            let mut points = vec![];
-            for &(temp, percent) in self.edits.iter().take(self.curve.points.len()) {
-                let celsius = get_text(temp)
-                    .replace(',', ".")
-                    .parse()
-                    .map_err(|_| "Informe uma temperatura numérica em cada ponto.")?;
-                let percent = get_text(percent)
-                    .parse()
-                    .map_err(|_| "Informe uma velocidade inteira de 30 a 100%.")?;
-                points.push(Point { celsius, percent });
-            }
-            let curve = Curve { points };
-            curve.validate(self.settings.floor())?;
-            Ok(curve)
         }
     }
     unsafe fn refresh(&mut self) {
@@ -588,11 +463,11 @@ impl App {
                 self.metrics,
                 &format!("CPU  {temp}     ·     Ventoinha  {rpm}"),
             );
-            let hot = fresh && view.telemetry.temperature.is_some_and(|t| t >= 95.);
+            let hot = fresh && view.telemetry.temperature.is_some_and(|t| t >= MAX_TEMP);
             set_text(
                 self.status,
                 if hot {
-                    "Temperatura elevada (95°C ou mais). Reduza a carga e verifique a ventilação do notebook."
+                    "Temperatura elevada (85°C ou mais). Reduza a carga e verifique a ventilação do notebook."
                 } else {
                     &view.message
                 },
@@ -604,16 +479,24 @@ impl App {
                 write_wide(&mut data.szInfoTitle, "A-Fan · Temperatura elevada");
                 write_wide(
                     &mut data.szInfo,
-                    "CPU a 95°C ou mais. Verifique a ventilação e reduza a carga.",
+                    "CPU a 85°C ou mais. Verifique a ventilação e reduza a carga.",
                 );
                 let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
             }
-            self.heat_alert_shown = hot;
+            if hot {
+                self.heat_alert_shown = true;
+            } else if fresh && view.telemetry.temperature.is_some_and(|t| t < 80.) {
+                self.heat_alert_shown = false;
+            }
             set_text(
                 self.active,
                 &format!(
                     "Ativo: {}{}",
-                    view.active.label(),
+                    if view.recovery_failed {
+                        "Indeterminado · retorno à Acer não confirmado"
+                    } else {
+                        view.active.label()
+                    },
                     if view.calibrating {
                         " · Calibração em andamento"
                     } else {
@@ -634,7 +517,14 @@ impl App {
                     && !view.calibrating
                     && self.smoke.is_none(),
             );
-            let tooltip = format!("A-Fan · {temp} · {rpm}\n{}", view.active.label());
+            let tooltip = format!(
+                "A-Fan · {temp} · {rpm}\n{}",
+                if view.recovery_failed {
+                    "Retorno à Acer não confirmado"
+                } else {
+                    view.active.label()
+                }
+            );
             if tooltip != self.last_tooltip {
                 let mut data = self.tray_data();
                 data.uFlags = NIF_TIP | NIF_SHOWTIP;
@@ -651,13 +541,6 @@ impl App {
                 self.curve = self.settings.curve();
                 self.selected = self.settings.profile;
                 self.load_curve();
-            }
-            if self.pending_save && view.settings.custom_curve == self.settings.custom_curve {
-                self.pending_save = false;
-                set_text(
-                    self.footer,
-                    "Curva salva. A aplicação depende de controle e calibração validados.",
-                );
             }
             if view.exit_ready {
                 let _ = PostMessageW(Some(self.hwnd), EXIT_MESSAGE, WPARAM(0), LPARAM(0));
@@ -679,27 +562,33 @@ impl App {
             match probe.stage {
                 0 => {
                     probe.initial_hidden = !IsWindowVisible(self.hwnd).as_bool();
-                    let original = self.curve.clone();
-                    let count = original.points.len();
-                    let add = if count < 8 {
-                        self.action(ID_ADD).is_ok() && self.curve.points.len() == count + 1
-                    } else {
-                        true
-                    };
-                    self.curve = original.clone();
+                    let original = self.selected;
+                    probe.presets_valid = true;
+                    for profile in Profile::ALL {
+                        self.selected = profile;
+                        self.curve = Curve::preset(profile, self.settings.floor());
+                        self.load_curve();
+                        let index = SendMessageW(
+                            self.combo,
+                            CB_GETCURSEL,
+                            Some(WPARAM(0)),
+                            Some(LPARAM(0)),
+                        )
+                        .0;
+                        probe.presets_valid &= index >= 0
+                            && Profile::ALL.get(index as usize) == Some(&profile)
+                            && self.curve.validate(self.settings.floor()).is_ok()
+                            && get_text(self.combo) == profile.label()
+                            && get_text(self.description) == profile.description();
+                    }
+                    probe.manual_controls_absent =
+                        FindWindowExW(Some(self.hwnd), None, w!("EDIT"), PCWSTR::null()).is_err()
+                            && [103, 104, 105, 106]
+                                .iter()
+                                .all(|id| GetDlgItem(Some(self.hwnd), *id).is_err());
+                    self.selected = original;
+                    self.curve = Curve::preset(original, self.settings.floor());
                     self.load_curve();
-                    let remove = if count > 2 {
-                        self.action(ID_REMOVE).is_ok() && self.curve.points.len() == count - 1
-                    } else {
-                        true
-                    };
-                    self.curve = original;
-                    self.load_curve();
-                    let temperature = get_text(self.edits[0].0);
-                    set_text(self.edits[0].0, "NaN");
-                    let invalid = self.read_curve().is_err();
-                    set_text(self.edits[0].0, &temperature);
-                    probe.editor_valid = add && remove && invalid && self.read_curve().is_ok();
                     if !view.telemetry.controls_available {
                         self.runtime.send(Request::Apply(self.settings.clone()));
                     }
@@ -727,7 +616,7 @@ impl App {
                 }
                 _ => {
                     let report = serde_json::json!({"window_created":true,"starts_hidden":probe.initial_hidden,"minimize_hides":probe.minimize_hides,
-                    "close_hides":!IsWindowVisible(self.hwnd).as_bool(),"tray_added":self.tray_added,"editor_validated":probe.editor_valid,
+                    "close_hides":!IsWindowVisible(self.hwnd).as_bool(),"tray_added":self.tray_added,"presets_validated":probe.presets_valid,"manual_controls_absent":probe.manual_controls_absent,"preset_count":Profile::ALL.len()-1,
                     "capture_error":probe.capture_error,"temperature":view.telemetry.temperature,"rpm":view.telemetry.rpm,
                     "controls_available":view.telemetry.controls_available,"apply_enabled":IsWindowEnabled(self.apply).as_bool(),
                     "calibrate_enabled":IsWindowEnabled(self.calibrate).as_bool(),"active_profile":view.active,
@@ -762,53 +651,6 @@ impl App {
                     {
                         self.runtime.send(Request::Calibrate);
                     }
-                }
-                ID_PREVIEW => {
-                    self.curve = self.read_curve()?;
-                    self.load_curve();
-                    set_text(
-                        self.footer,
-                        "Prévia atualizada. A ventoinha não foi alterada.",
-                    );
-                }
-                ID_SAVE => {
-                    self.curve = self.read_curve()?;
-                    self.settings.custom_curve = self.curve.clone();
-                    self.selected = Profile::Custom;
-                    self.pending_save = true;
-                    self.runtime.send(Request::SaveDraft(self.settings.clone()));
-                    self.load_curve();
-                    set_text(self.footer, "Salvando curva sem alterar o perfil ativo…");
-                }
-                ID_ADD => {
-                    self.curve = self.read_curve()?;
-                    if self.curve.points.len() >= 8 {
-                        return Err("O editor admite até 8 pontos.".into());
-                    }
-                    let (index, pair) = self
-                        .curve
-                        .points
-                        .windows(2)
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| {
-                            (a[1].celsius - a[0].celsius).total_cmp(&(b[1].celsius - b[0].celsius))
-                        })
-                        .unwrap();
-                    let celsius = ((pair[0].celsius + pair[1].celsius) * 5.).round() / 10.;
-                    let percent = self.curve.percent(celsius);
-                    self.curve
-                        .points
-                        .insert(index + 1, Point { celsius, percent });
-                    self.load_curve();
-                }
-                ID_REMOVE => {
-                    self.curve = self.read_curve()?;
-                    if self.curve.points.len() <= 2 {
-                        return Err("Mantenha pelo menos dois pontos na curva.".into());
-                    }
-                    let index = self.focused_row.min(self.curve.points.len() - 2);
-                    self.curve.points.remove(index);
-                    self.load_curve();
                 }
                 ID_STARTUP => {
                     let enabled =
@@ -848,7 +690,9 @@ impl App {
                         "Confirmando retorno ao automático Acer antes de sair…",
                     );
                 }
-                value if (ID_MENU_PROFILE..ID_MENU_PROFILE + 5).contains(&value) => {
+                value
+                    if (ID_MENU_PROFILE..ID_MENU_PROFILE + Profile::ALL.len()).contains(&value) =>
+                {
                     self.selected = Profile::ALL[value - ID_MENU_PROFILE];
                     self.settings.profile = self.selected;
                     self.curve = self.settings.curve();
@@ -870,7 +714,7 @@ impl App {
             let view = self.runtime.view();
             for (index, profile) in Profile::ALL.iter().enumerate() {
                 let mut flags = MF_STRING;
-                if *profile == view.active {
+                if *profile == view.active && !view.recovery_failed {
                     flags |= MF_CHECKED;
                 }
                 if *profile != Profile::Firmware
@@ -928,6 +772,14 @@ impl App {
             let old_font = SelectObject(dc, self.font.into());
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, COLORREF(0x484848));
+            if self.selected == Profile::Firmware {
+                let text: Vec<u16> = "Curva administrada pelo firmware Acer"
+                    .encode_utf16()
+                    .collect();
+                let _ = TextOutW(dc, self.px(30), self.px(400), &text);
+                SelectObject(dc, old_font);
+                return;
+            }
             let left = self.px(65);
             let top = self.px(355);
             let width = self.px(326);
@@ -1119,20 +971,12 @@ unsafe extern "system" fn window_proc(
                 if id == ID_PROFILE && notification == CBN_SELCHANGE as usize && !app.loading {
                     let index =
                         SendMessageW(app.combo, CB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0;
-                    if (0..5).contains(&index) {
+                    if (0..Profile::ALL.len() as isize).contains(&index) {
                         app.selected = Profile::ALL[index as usize];
-                        app.curve = if app.selected == Profile::Custom {
-                            app.settings.custom_curve.clone()
-                        } else {
-                            Curve::preset(app.selected, app.settings.floor())
-                        };
+                        app.curve = Curve::preset(app.selected, app.settings.floor());
                         app.load_curve();
                         app.refresh();
                     }
-                } else if (ID_EDIT..ID_EDIT + 16).contains(&id)
-                    && notification == EN_SETFOCUS as usize
-                {
-                    app.focused_row = (id - ID_EDIT) / 2;
                 } else if notification == BN_CLICKED as usize
                     && let Err(error) = app.action(id)
                 {
